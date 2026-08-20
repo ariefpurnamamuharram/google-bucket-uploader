@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Upload local file(s) or folder(s) to Google Cloud Storage, or download with --reverse."""
+"""Upload local file(s) or folder(s) to Google Cloud Storage, or download with --reverse.
+
+Use --filters to limit transfers to glob patterns (e.g. --filters '*.log').
+"""
 
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import os
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -87,7 +92,44 @@ def join_blob_prefix(prefix: str, *parts: str) -> str:
     return "/".join(segments)
 
 
-def collect_uploads(source: Path, target_prefix: str) -> list[tuple[Path, str]]:
+def parse_filters(raw: Sequence[str] | None) -> list[str]:
+    """Normalize glob patterns from --filters (spaces and/or commas)."""
+    if not raw:
+        return []
+
+    patterns: list[str] = []
+    for item in raw:
+        for part in item.split(","):
+            pattern = part.strip()
+            if pattern:
+                patterns.append(pattern)
+    return patterns
+
+
+def matches_filters(path: str, filters: Sequence[str]) -> bool:
+    """Return True if path matches any glob, or if no filters are set."""
+    if not filters:
+        return True
+
+    name = path.replace("\\", "/").lstrip("/")
+    basename = Path(name).name
+    return any(
+        fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(basename, pattern)
+        for pattern in filters
+    )
+
+
+def _filters_suffix(filters: Sequence[str]) -> str:
+    if not filters:
+        return ""
+    return f" matching filters: {', '.join(filters)}"
+
+
+def collect_uploads(
+    source: Path,
+    target_prefix: str,
+    filters: Sequence[str] = (),
+) -> list[tuple[Path, str]]:
     """Map a local file or directory to (local_path, blob_name) pairs."""
     source = source.resolve()
 
@@ -95,6 +137,10 @@ def collect_uploads(source: Path, target_prefix: str) -> list[tuple[Path, str]]:
         raise FileNotFoundError(f"source does not exist: {source}")
 
     if source.is_file():
+        if not matches_filters(source.name, filters):
+            raise ValueError(
+                f"source file does not match filters: {source}{_filters_suffix(filters)}"
+            )
         blob_name = join_blob_prefix(target_prefix, source.name)
         return [(source, blob_name)]
 
@@ -104,9 +150,15 @@ def collect_uploads(source: Path, target_prefix: str) -> list[tuple[Path, str]]:
         for path in sorted(source.rglob("*")):
             if path.is_file():
                 relative = path.relative_to(source).as_posix()
+                if not matches_filters(relative, filters):
+                    continue
                 blob_name = join_blob_prefix(base_prefix, relative)
                 uploads.append((path, blob_name))
         if not uploads:
+            if filters:
+                raise ValueError(
+                    f"source directory has no files{_filters_suffix(filters)}: {source}"
+                )
             raise ValueError(f"source directory is empty: {source}")
         return uploads
 
@@ -118,14 +170,20 @@ def collect_downloads(
     bucket_name: str,
     source_prefix: str,
     local_target: Path,
+    filters: Sequence[str] = (),
 ) -> list[tuple[str, str, Path]]:
     """Map a GCS object or prefix to (bucket_name, blob_name, local_path) triples."""
     bucket = client.bucket(bucket_name)
     source_prefix = source_prefix.strip("/")
+    location = f"gs://{bucket_name}/{source_prefix}" if source_prefix else f"gs://{bucket_name}/"
 
     if source_prefix:
         exact = bucket.blob(source_prefix)
         if exact.exists():
+            if not matches_filters(source_prefix, filters):
+                raise FileNotFoundError(
+                    f"object {location} does not match{_filters_suffix(filters)}"
+                )
             return [(bucket_name, source_prefix, local_target / Path(source_prefix).name)]
 
     list_prefix = f"{source_prefix}/" if source_prefix else ""
@@ -134,7 +192,6 @@ def collect_downloads(
         key=lambda blob: blob.name,
     )
     if not blobs:
-        location = f"gs://{bucket_name}/{source_prefix}" if source_prefix else f"gs://{bucket_name}/"
         raise FileNotFoundError(f"no objects found at {location}")
 
     base_name = Path(source_prefix).name if source_prefix else ""
@@ -143,12 +200,13 @@ def collect_downloads(
         relative = blob.name[len(list_prefix) :] if list_prefix else blob.name
         if not relative:
             continue
+        if not matches_filters(relative, filters) and not matches_filters(blob.name, filters):
+            continue
         local_path = local_target / base_name / relative if base_name else local_target / relative
         downloads.append((bucket_name, blob.name, local_path))
 
     if not downloads:
-        location = f"gs://{bucket_name}/{source_prefix}" if source_prefix else f"gs://{bucket_name}/"
-        raise FileNotFoundError(f"no objects found at {location}")
+        raise FileNotFoundError(f"no objects found at {location}{_filters_suffix(filters)}")
 
     return downloads
 
@@ -250,6 +308,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Download from GCS to local: --source is GCS path(s), --target is a local directory.",
     )
     parser.add_argument(
+        "--filters",
+        nargs="+",
+        default=[],
+        metavar="PATTERN",
+        help=(
+            "Only transfer files matching one or more glob patterns "
+            "(e.g. '*.log' or '*.log' '*.txt'). Quote patterns to prevent shell expansion. "
+            "A file matches if its name or relative path matches any pattern. "
+            "Applies to both upload and download."
+        ),
+    )
+    parser.add_argument(
         "--no-progress",
         action="store_true",
         help="Disable the transfer progress bar.",
@@ -264,10 +334,11 @@ def run_upload(args: argparse.Namespace, client: storage.Client, show_progress: 
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    filters = parse_filters(args.filters)
     uploads: list[tuple[Path, str]] = []
     for source_str in args.source:
         try:
-            uploads.extend(collect_uploads(Path(source_str), target_prefix))
+            uploads.extend(collect_uploads(Path(source_str), target_prefix, filters))
         except (FileNotFoundError, ValueError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -297,12 +368,13 @@ def run_download(args: argparse.Namespace, client: storage.Client, show_progress
         return 1
     local_target.mkdir(parents=True, exist_ok=True)
 
+    filters = parse_filters(args.filters)
     downloads: list[tuple[str, str, Path]] = []
     for source_str in args.source:
         try:
             bucket_name, source_prefix = resolve_gcs_path(source_str, arg_name="--source")
             downloads.extend(
-                collect_downloads(client, bucket_name, source_prefix, local_target)
+                collect_downloads(client, bucket_name, source_prefix, local_target, filters)
             )
         except (FileNotFoundError, ValueError) as exc:
             print(f"error: {exc}", file=sys.stderr)
